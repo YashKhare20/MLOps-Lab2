@@ -2,52 +2,63 @@
 from __future__ import annotations
 
 import os
+import json
 import time
 import pendulum
 import requests
 from airflow import DAG
-from airflow.providers.standard.operators.python import PythonOperator
-from flask import Flask, redirect, render_template
+from airflow.operators.python import PythonOperator
+from flask import Flask, redirect, render_template, jsonify
 
-# ---------- Config (Airflow 3: use REST with Basic Auth via FAB API backend) ----------
-WEBSERVER = os.getenv("AIRFLOW_WEBSERVER", "http://airflow-apiserver:8080")
-AF_USER   = os.getenv("AIRFLOW_USERNAME", os.getenv("_AIRFLOW_WWW_USER_USERNAME", "airflow"))
-AF_PASS   = os.getenv("AIRFLOW_PASSWORD", os.getenv("_AIRFLOW_WWW_USER_PASSWORD", "airflow"))
+# Configuration
+WEBSERVER = os.getenv("AIRFLOW_WEBSERVER", "http://airflow-webserver:8080")
+AF_USER = os.getenv("AIRFLOW_USERNAME", os.getenv("_AIRFLOW_WWW_USER_USERNAME", "airflow"))
+AF_PASS = os.getenv("AIRFLOW_PASSWORD", os.getenv("_AIRFLOW_WWW_USER_PASSWORD", "airflow"))
 TARGET_DAG_ID = os.getenv("TARGET_DAG_ID", "Airflow_Lab2")
+MODEL_DIR = "/opt/airflow/model"
 
-# ---------- Default args ----------
+# Default args
 default_args = {
     "start_date": pendulum.datetime(2024, 1, 1, tz="UTC"),
     "retries": 0,
 }
 
-# ---------- Flask app ----------
+# Flask app
 app = Flask(__name__, template_folder="templates")
+
 
 def get_latest_run_info():
     """
-    Query Airflow stable REST API (/api/v2) using Basic Auth.
-    Requires Airflow to be configured with:
-      AIRFLOW__FAB__AUTH_BACKENDS=airflow.providers.fab.auth_manager.api.auth.backend.basic_auth
+    Query Airflow stable REST API (/api/v2) using Basic Auth and load metrics.
     """
     url = f"{WEBSERVER}/api/v2/dags/{TARGET_DAG_ID}/dagRuns?order_by=-logical_date&limit=1"
+    
     try:
         r = requests.get(url, auth=(AF_USER, AF_PASS), timeout=5)
     except Exception as e:
-        return False, {"note": f"Exception calling Airflow API: {e}"}
+        return False, {"note": f"Exception calling Airflow API: {e}", "metrics": {}}
 
-    # If auth/backend is not set correctly you'll get 401 here.
     if r.status_code != 200:
-        # Surface a short note (kept small to avoid template overflow)
         snippet = r.text[:200].replace("\n", " ")
-        return False, {"note": f"API status {r.status_code}: {snippet}"}
+        return False, {"note": f"API status {r.status_code}: {snippet}", "metrics": {}}
 
     runs = r.json().get("dag_runs", [])
     if not runs:
-        return False, {"note": "No DagRuns found yet."}
+        return False, {"note": "No DagRuns found yet.", "metrics": {}}
 
     run = runs[0]
     state = run.get("state")
+    
+    # Load model metrics if available
+    metrics = {}
+    metrics_path = os.path.join(MODEL_DIR, "metrics.json")
+    if os.path.exists(metrics_path):
+        try:
+            with open(metrics_path, "r") as f:
+                metrics = json.load(f)
+        except Exception as e:
+            print(f"Error loading metrics: {e}")
+    
     info = {
         "state": state,
         "run_id": run.get("dag_run_id"),
@@ -55,7 +66,9 @@ def get_latest_run_info():
         "start_date": run.get("start_date"),
         "end_date": run.get("end_date"),
         "note": "",
+        "metrics": metrics,
     }
+    
     return state == "success", info
 
 
@@ -64,19 +77,30 @@ def index():
     ok, _ = get_latest_run_info()
     return redirect("/success" if ok else "/failure")
 
+
 @app.route("/success")
 def success():
     ok, info = get_latest_run_info()
     return render_template("success.html", **info)
+
 
 @app.route("/failure")
 def failure():
     ok, info = get_latest_run_info()
     return render_template("failure.html", **info)
 
+
+@app.route("/metrics")
+def metrics():
+    """Endpoint to view model metrics as JSON"""
+    _, info = get_latest_run_info()
+    return jsonify(info.get("metrics", {}))
+
+
 @app.route("/health")
 def health():
     return "ok", 200
+
 
 def start_flask_app():
     """
@@ -89,12 +113,13 @@ def start_flask_app():
     while True:
         time.sleep(60)
 
-# ---------- DAG ----------
+
+# DAG
 flask_api_dag = DAG(
     dag_id="Airflow_Lab2_Flask",
     default_args=default_args,
     description="DAG to manage Flask API lifecycle",
-    schedule=None,                 # trigger-only
+    schedule=None,
     catchup=False,
     is_paused_upon_creation=False,
     tags=["Flask_Api"],
